@@ -1,0 +1,274 @@
+/*************************************************
+ * WASTE NOT 新着監視（最終版）
+ *************************************************/
+
+const WEBHOOK_URL = "https://discord.com/api/webhooks/1513153339330924717/I1-vQvbN1YabE0MzTaN5qaBKtkeCXEtyYaex9YLXKSNAhE4AP2SETFCaph3Q_K8XNZVG";
+
+const FETCH_LIMIT = 100;
+
+const PRODUCTS_URL =
+  `https://wastenot-official.com/collections/newarrivals-all/products.json?limit=${FETCH_LIMIT}`;
+
+const COLLECTION_URL =
+  "https://wastenot-official.com/collections/newarrivals-all";
+
+const MAX_MESSAGE_LENGTH = 1800;
+
+
+/*************************************************
+ * メイン処理
+ *************************************************/
+function checkNewItems() {
+
+  console.log("===== checkNewItems START =====");
+
+  const props = PropertiesService.getScriptProperties();
+
+  const response = UrlFetchApp.fetch(PRODUCTS_URL, {
+
+    muteHttpExceptions: true,
+
+    headers: {
+      "User-Agent": "Mozilla/5.0"
+    }
+
+  });
+
+  console.log("Products Status : " + response.getResponseCode());
+
+  if (response.getResponseCode() != 200) {
+
+    console.log(response.getContentText());
+
+    return;
+
+  }
+
+  const data = JSON.parse(response.getContentText());
+
+  const products = data.products || [];
+
+  console.log("取得件数 : " + products.length);
+
+  //------------------------------------------------
+  // published_at 最大値
+  //------------------------------------------------
+
+  let newestPublished = "";
+
+  products.forEach(product => {
+
+    if (product.published_at > newestPublished) {
+
+      newestPublished = product.published_at;
+
+    }
+
+  });
+
+  const lastPublished =
+    props.getProperty("lastPublishedAt");
+
+  //------------------------------------------------
+  // 初回
+  //------------------------------------------------
+
+  if (!lastPublished) {
+
+    props.setProperty(
+      "lastPublishedAt",
+      newestPublished
+    );
+
+    console.log("初回登録のみ");
+
+    return;
+
+  }
+
+  //------------------------------------------------
+  // 新商品抽出
+  //------------------------------------------------
+
+  const newProducts = products.filter(product => {
+
+    return product.published_at > lastPublished;
+
+  });
+
+  console.log("新商品件数 : " + newProducts.length);
+
+  //------------------------------------------------
+  // 最新日時保存
+  //------------------------------------------------
+
+  props.setProperty(
+    "lastPublishedAt",
+    newestPublished
+  );
+
+  if (newProducts.length == 0) {
+
+    console.log("新商品なし");
+
+    return;
+
+  }
+
+  //------------------------------------------------
+  // 公開日時順
+  //------------------------------------------------
+
+  newProducts.sort((a,b)=>{
+
+    return new Date(a.published_at)
+      - new Date(b.published_at);
+
+  });
+
+  sendDiscord(newProducts);
+
+}
+
+
+/*************************************************
+ * Discord通知
+ *************************************************/
+function sendDiscord(products){
+
+  let message =
+`🆕 WASTE NOT 新商品 ${products.length}件追加
+
+`;
+
+  products.forEach(product=>{
+
+    const price =
+      Number(product.variants[0].price)
+      .toLocaleString();
+
+    const line =
+
+`■ ${product.title}
+¥${price}
+https://wastenot-official.com/products/${product.handle}
+
+`;
+
+    if(message.length + line.length < MAX_MESSAGE_LENGTH){
+
+      message += line;
+
+    }
+
+  });
+
+  //------------------------------------------------
+  // 長すぎる場合
+  //------------------------------------------------
+
+  if(message.length >= MAX_MESSAGE_LENGTH){
+
+    message =
+`🆕 WASTE NOT 新商品 ${products.length}件追加
+
+通知が長いため省略しました。
+
+一覧はこちら
+${COLLECTION_URL}`;
+
+  }
+
+  postDiscord(message);
+
+}
+
+
+/*************************************************
+ * Discord送信
+ *************************************************/
+function postDiscord(message){
+
+  const payload={
+
+    content:message
+
+  };
+
+  let response = UrlFetchApp.fetch(
+
+    WEBHOOK_URL,
+
+    {
+
+      method:"post",
+
+      contentType:"application/json",
+
+      payload:JSON.stringify(payload),
+
+      muteHttpExceptions:true
+
+    }
+
+  );
+
+  console.log("Discord Status : " + response.getResponseCode());
+
+  //------------------------------------------------
+  // 429なら30秒後に1回だけ再送
+  //------------------------------------------------
+
+  if(response.getResponseCode()==429){
+
+    console.log("429検出");
+
+    Utilities.sleep(30000);
+
+    response = UrlFetchApp.fetch(
+
+      WEBHOOK_URL,
+
+      {
+
+        method:"post",
+
+        contentType:"application/json",
+
+        payload:JSON.stringify(payload),
+
+        muteHttpExceptions:true
+
+      }
+
+    );
+
+    console.log("Retry Status : " + response.getResponseCode());
+
+  }
+
+}
+
+
+/*************************************************
+ * テスト通知
+ *************************************************/
+function testDiscord(){
+
+  postDiscord("テスト通知");
+
+}
+
+
+/*************************************************
+ * 初期化
+ *************************************************/
+function resetMonitor(){
+
+  PropertiesService
+    .getScriptProperties()
+    .deleteAllProperties();
+
+  console.log("初期化完了");
+
+}
