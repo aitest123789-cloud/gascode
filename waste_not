@@ -1,274 +1,228 @@
 /*************************************************
- * WASTE NOT 新着監視（最終版）
+ * WASTE NOT 新着監視（429リカバリ版）
  *************************************************/
 
 const WEBHOOK_URL = "https://discord.com/api/webhooks/1513153339330924717/I1-vQvbN1YabE0MzTaN5qaBKtkeCXEtyYaex9YLXKSNAhE4AP2SETFCaph3Q_K8XNZVG";
 
 const FETCH_LIMIT = 100;
-
-const PRODUCTS_URL =
-  `https://wastenot-official.com/collections/newarrivals-all/products.json?limit=${FETCH_LIMIT}`;
-
-const COLLECTION_URL =
-  "https://wastenot-official.com/collections/newarrivals-all";
-
+const PRODUCTS_URL = `https://wastenot-official.com/collections/newarrivals-all/products.json?limit=${FETCH_LIMIT}`;
+const COLLECTION_URL = "https://wastenot-official.com/collections/newarrivals-all";
 const MAX_MESSAGE_LENGTH = 1800;
+
+// 失敗時にエラーメールを送る宛先（空にすればメール無効）
+const ALERT_EMAIL = "aitest123789@gmail.com";
+
+const PENDING_KEY = "pendingMessages"; // 未送信キュー保存キー
 
 
 /*************************************************
  * メイン処理
  *************************************************/
 function checkNewItems() {
-
   console.log("===== checkNewItems START =====");
-
   const props = PropertiesService.getScriptProperties();
 
+  // ① まず前回までの未送信メッセージを再送（429が解けていれば届く）
+  flushPending(props);
+
   const response = UrlFetchApp.fetch(PRODUCTS_URL, {
-
     muteHttpExceptions: true,
-
-    headers: {
-      "User-Agent": "Mozilla/5.0"
-    }
-
+    headers: { "User-Agent": "Mozilla/5.0", "Accept": "application/json" }
   });
 
   console.log("Products Status : " + response.getResponseCode());
-
   if (response.getResponseCode() != 200) {
-
-    console.log(response.getContentText());
-
+    console.log(response.getContentText().slice(0, 500));
     return;
-
   }
 
   const data = JSON.parse(response.getContentText());
-
   const products = data.products || [];
-
   console.log("取得件数 : " + products.length);
 
-  //------------------------------------------------
-  // published_at 最大値
-  //------------------------------------------------
-
   let newestPublished = "";
+  products.forEach(p => { if (p.published_at > newestPublished) newestPublished = p.published_at; });
 
-  products.forEach(product => {
+  const lastPublished = props.getProperty("lastPublishedAt");
 
-    if (product.published_at > newestPublished) {
-
-      newestPublished = product.published_at;
-
-    }
-
-  });
-
-  const lastPublished =
-    props.getProperty("lastPublishedAt");
-
-  //------------------------------------------------
   // 初回
-  //------------------------------------------------
-
   if (!lastPublished) {
-
-    props.setProperty(
-      "lastPublishedAt",
-      newestPublished
-    );
-
+    props.setProperty("lastPublishedAt", newestPublished);
     console.log("初回登録のみ");
-
     return;
-
   }
 
-  //------------------------------------------------
-  // 新商品抽出
-  //------------------------------------------------
-
-  const newProducts = products.filter(product => {
-
-    return product.published_at > lastPublished;
-
-  });
-
+  const newProducts = products.filter(p => p.published_at > lastPublished);
   console.log("新商品件数 : " + newProducts.length);
 
-  //------------------------------------------------
-  // 最新日時保存
-  //------------------------------------------------
-
-  props.setProperty(
-    "lastPublishedAt",
-    newestPublished
-  );
-
   if (newProducts.length == 0) {
-
     console.log("新商品なし");
-
+    props.setProperty("lastPublishedAt", newestPublished); // 進めてOK（新規なし）
     return;
-
   }
 
-  //------------------------------------------------
-  // 公開日時順
-  //------------------------------------------------
+  newProducts.sort((a, b) => new Date(a.published_at) - new Date(b.published_at));
 
-  newProducts.sort((a,b)=>{
+  const message = buildMessage(newProducts);
 
-    return new Date(a.published_at)
-      - new Date(b.published_at);
-
-  });
-
-  sendDiscord(newProducts);
-
+  // ② 送信し、成功したときだけ最新日時を進める
+  const ok = postDiscord(message);
+  if (ok) {
+    props.setProperty("lastPublishedAt", newestPublished);
+  } else {
+    // ③ 失敗 → キューに保存（次回再送）＋ メールで即通知
+    enqueuePending(props, message);
+    props.setProperty("lastPublishedAt", newestPublished); // 商品情報はキューに退避済みなので進めて二重検出を防ぐ
+    notifyByEmail(
+      "【WASTE NOT監視】Discord通知に失敗(429)",
+      "Discordがレート制限(429)のため新商品通知を送れませんでした。\n" +
+      "未送信分は次回実行時に自動再送します。\n\n--- 未送信内容 ---\n" + message
+    );
+  }
 }
 
 
 /*************************************************
- * Discord通知
+ * 未送信キューの再送
  *************************************************/
-function sendDiscord(products){
+function flushPending(props) {
+  const raw = props.getProperty(PENDING_KEY);
+  if (!raw) return;
 
-  let message =
-`🆕 WASTE NOT 新商品 ${products.length}件追加
+  let queue;
+  try { queue = JSON.parse(raw); } catch (e) { queue = []; }
+  if (!queue.length) return;
 
-`;
+  console.log("未送信キュー再送開始: " + queue.length + "件");
+  const remain = [];
 
-  products.forEach(product=>{
-
-    const price =
-      Number(product.variants[0].price)
-      .toLocaleString();
-
-    const line =
-
-`■ ${product.title}
-¥${price}
-https://wastenot-official.com/products/${product.handle}
-
-`;
-
-    if(message.length + line.length < MAX_MESSAGE_LENGTH){
-
-      message += line;
-
-    }
-
+  queue.forEach(msg => {
+    const ok = postDiscord(msg);
+    if (!ok) remain.push(msg); // まだダメなら残す
   });
 
-  //------------------------------------------------
-  // 長すぎる場合
-  //------------------------------------------------
-
-  if(message.length >= MAX_MESSAGE_LENGTH){
-
-    message =
-`🆕 WASTE NOT 新商品 ${products.length}件追加
-
-通知が長いため省略しました。
-
-一覧はこちら
-${COLLECTION_URL}`;
-
+  if (remain.length) {
+    props.setProperty(PENDING_KEY, JSON.stringify(remain));
+    console.log("再送できなかった残: " + remain.length + "件");
+  } else {
+    props.deleteProperty(PENDING_KEY);
+    console.log("未送信キューを全て再送完了");
   }
+}
 
-  postDiscord(message);
-
+function enqueuePending(props, message) {
+  const raw = props.getProperty(PENDING_KEY);
+  let queue = [];
+  try { queue = raw ? JSON.parse(raw) : []; } catch (e) { queue = []; }
+  queue.push(message);
+  // 溜まりすぎ防止（最新20件まで）
+  if (queue.length > 20) queue = queue.slice(queue.length - 20);
+  props.setProperty(PENDING_KEY, JSON.stringify(queue));
+  console.log("未送信キューに保存。現在 " + queue.length + "件");
 }
 
 
 /*************************************************
- * Discord送信
+ * メッセージ生成
  *************************************************/
-function postDiscord(message){
+function buildMessage(products) {
+  let message = `🆕 WASTE NOT 新商品 ${products.length}件追加\n\n`;
+  products.forEach(p => {
+    const price = Number(p.variants[0].price).toLocaleString();
+    const line = `■ ${p.title}\n¥${price}\nhttps://wastenot-official.com/products/${p.handle}\n\n`;
+    if (message.length + line.length < MAX_MESSAGE_LENGTH) message += line;
+  });
+  if (message.length >= MAX_MESSAGE_LENGTH) {
+    message = `🆕 WASTE NOT 新商品 ${products.length}件追加\n\n通知が長いため省略しました。\n\n一覧はこちら\n${COLLECTION_URL}`;
+  }
+  return message;
+}
 
-  const payload={
 
-    content:message
-
+/*************************************************
+ * Discord送信（成功=true / 失敗=false を返す）
+ *   429は retry_after を尊重して最大3回まで再送
+ *************************************************/
+function postDiscord(message) {
+  const options = {
+    method: "post",
+    contentType: "application/json",
+    payload: JSON.stringify({ content: message }),
+    muteHttpExceptions: true
   };
 
-  let response = UrlFetchApp.fetch(
+  const MAX_ATTEMPTS = 3;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    const res = UrlFetchApp.fetch(WEBHOOK_URL, options);
+    const code = res.getResponseCode();
+    console.log(`Discord Status (try ${attempt}) : ${code}`);
 
-    WEBHOOK_URL,
-
-    {
-
-      method:"post",
-
-      contentType:"application/json",
-
-      payload:JSON.stringify(payload),
-
-      muteHttpExceptions:true
-
+    if (code >= 200 && code < 300) return true;   // 成功（通常204）
+    if (code !== 429) {                            // 429以外のエラーは再送しても無駄
+      console.log("Discord error: " + res.getContentText().slice(0, 300));
+      return false;
     }
 
-  );
-
-  console.log("Discord Status : " + response.getResponseCode());
-
-  //------------------------------------------------
-  // 429なら30秒後に1回だけ再送
-  //------------------------------------------------
-
-  if(response.getResponseCode()==429){
-
-    console.log("429検出");
-
-    Utilities.sleep(30000);
-
-    response = UrlFetchApp.fetch(
-
-      WEBHOOK_URL,
-
-      {
-
-        method:"post",
-
-        contentType:"application/json",
-
-        payload:JSON.stringify(payload),
-
-        muteHttpExceptions:true
-
+    // --- 429 の待ち時間を算出 ---
+    let waitSec = 5;
+    try {
+      const body = JSON.parse(res.getContentText());
+      if (typeof body.retry_after === "number") {
+        waitSec = body.retry_after;
+        console.log(`429 global=${body.global} retry_after=${waitSec}s`);
       }
+    } catch (e) {
+      console.log("429本文がJSONでない→Cloudflare/共有IP制限の可能性");
+    }
+    const ra = res.getAllHeaders()["Retry-After"] || res.getAllHeaders()["retry-after"];
+    if (ra) waitSec = Math.max(waitSec, Number(ra));
 
-    );
+    waitSec = Math.min(Math.ceil(waitSec) + 1, 60); // 上限60秒
 
-    console.log("Retry Status : " + response.getResponseCode());
-
+    if (attempt < MAX_ATTEMPTS) {
+      console.log(`${waitSec}秒待機して再送`);
+      Utilities.sleep(waitSec * 1000);
+    }
   }
-
+  console.log("Discord送信失敗（429継続）→ キューに退避します");
+  return false;
 }
 
 
 /*************************************************
- * テスト通知
+ * 失敗時のメール通知（Discordと別経路で確実に届く）
  *************************************************/
-function testDiscord(){
-
-  postDiscord("テスト通知");
-
+function notifyByEmail(subject, body) {
+  if (!ALERT_EMAIL) return;
+  try {
+    MailApp.sendEmail(ALERT_EMAIL, subject, body);
+    console.log("エラーメール送信: " + ALERT_EMAIL);
+  } catch (e) {
+    console.log("メール送信失敗: " + e);
+  }
 }
 
 
 /*************************************************
- * 初期化
+ * テスト / 初期化
  *************************************************/
-function resetMonitor(){
+function testDiscord() { postDiscord("テスト通知"); }
 
-  PropertiesService
-    .getScriptProperties()
-    .deleteAllProperties();
-
+function resetMonitor() {
+  PropertiesService.getScriptProperties().deleteAllProperties();
   console.log("初期化完了");
-
 }
+
+/*************************************************
+ * メール権限の承認用（1回だけ手動実行する）
+ *************************************************/
+function authorizeMail() {
+  MailApp.sendEmail(
+    "aitest123789@gmail.com",
+    "権限承認テスト",
+    "MailAppの送信権限を承認できました。"
+  );
+  console.log("メール送信成功");
+}
+
+
