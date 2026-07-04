@@ -2,7 +2,7 @@
  * WASTE NOT 新着監視（429リカバリ版）
  *************************************************/
 
-const WEBHOOK_URL = "https://discord.com/api/webhooks/1513153339330924717/I1-vQvbN1YabE0MzTaN5qaBKtkeCXEtyYaex9YLXKSNAhE4AP2SETFCaph3Q_K8XNZVG";
+const WEBHOOK_URL = "ｑｑｑXNZVG";
 
 const FETCH_LIMIT = 100;
 const PRODUCTS_URL = `https://wastenot-official.com/collections/newarrivals-all/products.json?limit=${FETCH_LIMIT}`;
