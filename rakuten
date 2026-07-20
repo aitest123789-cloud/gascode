@@ -1,0 +1,502 @@
+/*************************************************
+ * 楽天 BRING (bring-sg) 新着監視（GAS / 公式API版）
+ *   対象: https://www.rakuten.co.jp/bring-sg/
+ *
+ * ▼ 方式
+ *  - 楽天「Rakuten Ichiba Item Search API(2026-07-01版)」をJSONで叩き、
+ *    shopCode=bring-sg / sort=-updateTimestamp(更新新しい順=新着相当)で取得。
+ *  - スクレイピングではないので403やHTML構造変更で壊れにくい。
+ *  - 各商品の itemCode を一意IDにして、過去に見たID(seenIds)との差分で新着検出。
+ *
+ * ▼ 2026年新仕様の注意（未対応だと403）
+ *  - applicationId(クエリ) と accessKey(必須) が両方要る。
+ *    本実装は accessKey を「クエリparam＋ヘッダー」の両方に付けて確実化。
+ *  - アプリのタイプで認証方法が変わる:
+ *      「API/バックエンドサービス」型 → 許可IPで照合。GASはIPが動的なので
+ *        「許可されたIPアドレス」に 0.0.0.0/0（全許可）を設定する。★推奨（本運用）
+ *      「Webアプリケーション」型 → Origin/Refererで照合。「許可Webサイト」に
+ *        https://script.google.com を登録する。
+ *  - 下の Origin/Referer ヘッダーはWebアプリ型用の保険。バックエンド型では無視される。
+ *
+ * ▼ 他監視スクリプト(trefac等)と同居できるよう、全て _rakuten / _RAKUTEN を付与。
+ *
+ * ▼ 機能（trefac版から踏襲）
+ *  - Discord 429：retry_afterを尊重して再送＋失敗はキューで次回再送
+ *  - API 429/5xx：バックオフ再取得
+ *  - 件数超過：Discordは要約、全リンクはメールで送信
+ *  - 失敗/仕様変更疑い時：Gmailで通知
+ *************************************************/
+
+/*==============================================
+ * ★★ 設定（ここを埋める）★★
+ *============================================*/
+// 楽天アプリ情報（https://webservice.rakuten.co.jp で取得）
+const APP_ID_RAKUTEN     = "aa";
+const ACCESS_KEY_RAKUTEN = "aaa";
+
+// Discord Webhook（必要ならBRING用の別チャンネルに差し替え）
+const WEBHOOK_URL_RAKUTEN = "aa";
+
+// 失敗・全リンク送信の宛先（空にすればメール無効）
+const ALERT_EMAIL_RAKUTEN = "aitest123789@gmail.com";
+
+// Webアプリ型を選んだ場合のみ意味を持つ（許可Webサイトと一致させる）。
+// API/バックエンドサービス型（推奨）では無視されるので既定のままでOK。
+const ORIGIN_RAKUTEN = "https://script.google.com";
+
+/*==============================================
+ * 定数
+ *============================================*/
+const ENDPOINT_RAKUTEN = "https://openapi.rakuten.co.jp/ichibams/api/IchibaItem/Search/20260701";
+const SHOP_CODE_RAKUTEN = "bring-sg";
+const SHOP_TOP_RAKUTEN  = "https://www.rakuten.co.jp/bring-sg/";
+
+const HITS_RAKUTEN      = 30;   // 1ページ件数（APIの上限=30）
+const MAX_PAGES_RAKUTEN = 5;    // アダプティブ取得の上限ページ（30×5=最大150件/回）
+const MAX_SEEN_RAKUTEN  = 1000; // 記録するitemCodeの上限（古いものから捨てる）
+const MAX_MESSAGE_LENGTH_RAKUTEN = 1800; // Discord2000文字制限への安全マージン（要約時用）
+const EMBED_BATCH_RAKUTEN = 10; // Discordは1メッセージ最大10 embed
+
+const SEEN_KEY_RAKUTEN    = "rakutenSeenIds"; // 既知itemCode保存キー
+const PENDING_KEY_RAKUTEN = "rakutenPending"; // 未送信キュー保存キー
+
+/*************************************************
+ * メイン処理
+ *************************************************/
+function checkNewItems_rakuten() {
+  console.log("===== RAKUTEN(bring-sg) checkNewItems START =====");
+  const props = PropertiesService.getScriptProperties();
+
+  // ① まず前回までの未送信メッセージを再送（429が解けていれば届く）
+  flushPending_rakuten(props);
+
+  const seen = loadSeen_rakuten(props);   // 既知itemCodeセット
+  const firstRun = (seen.size === 0);
+
+  // ② 一覧をアダプティブ取得（新着順の先頭から、既知だけのページに達したら打ち切り）
+  const maxPages = firstRun ? 1 : MAX_PAGES_RAKUTEN; // 初回は登録だけなので軽く
+  const collected = collectItems_rakuten(seen, maxPages);
+  if (!collected.ok) {
+    console.log("API取得失敗(再試行後も): " + collected.reason);
+    return; // この回はスキップ（状態を更新しないので取りこぼしなし）
+  }
+
+  const items = collected.items; // 新着順（新しい→古い）
+  console.log("取得件数 : " + items.length + "（" + collected.pages + "ページ, 総ヒット" + collected.total + "）");
+
+  // 0件かつ総ヒット0でない → 仕様/構造変更の疑い
+  if (items.length === 0) {
+    if (collected.total === 0) {
+      console.log("現在該当商品なし（正常）。状態は変更しない");
+      return;
+    }
+    console.log("商品を1件もパースできませんでした（API仕様変更の可能性）");
+    notifyByEmail_rakuten(
+      "【楽天BRING監視】商品を取得できませんでした",
+      "APIレスポンスから商品を1件もパースできませんでした（総ヒットは0ではない）。\n" +
+      "APIの仕様が変わった可能性があります。parseItems_rakuten()を確認してください。\n" + SHOP_TOP_RAKUTEN
+    );
+    return;
+  }
+
+  const currentIds = items.map(it => it.id);
+
+  // ③ 初回は登録のみ（大量通知を防ぐ）
+  if (firstRun) {
+    saveSeen_rakuten(props, currentIds, seen);
+    console.log("初回登録のみ（" + currentIds.length + "件を記録）");
+    return;
+  }
+
+  // ④ 新着検出（seen-set差分）。APIが新着順なので、seenに無いitemCode=新着。
+  const newItems = items.filter(it => !seen.has(it.id));
+  console.log("新商品件数 : " + newItems.length);
+
+  if (newItems.length === 0) {
+    console.log("新商品なし");
+    saveSeen_rakuten(props, currentIds, seen); // 既知集合だけ更新
+    return;
+  }
+
+  // ⑤ 通知は古い→新しい順（新着が末尾に来るように）
+  newItems.reverse();
+
+  // ⑥ Discord送信（embed・10件バッチ）。全バッチ成功時だけ状態を更新する。
+  const okAll = postDiscordEmbeds_rakuten(props, newItems);
+
+  if (okAll) {
+    saveSeen_rakuten(props, currentIds, seen);
+  } else {
+    // 一部でも失敗 → 未送信分はキューに退避済み。状態は更新して二重検出を防ぎ、メール即通知。
+    saveSeen_rakuten(props, currentIds, seen);
+    notifyByEmail_rakuten(
+      `【楽天BRING】新商品 ${newItems.length}件（一部Discord送信失敗）`,
+      "Discordへの送信に失敗した分があります（レート制限など）。\n" +
+      "未送信分は次回実行時に自動再送します。\n\n" + buildFullList_rakuten(newItems)
+    );
+  }
+}
+
+/*************************************************
+ * アダプティブ・ページング取得
+ *  ・新着順の先頭ページから取得し、そのページが「全て既知ID」なら以降を打ち切り。
+ *  ・戻り値: { ok, items, pages, total, reason }
+ *      ok=false のときは1ページ目すら取得できなかった（この回はスキップ）
+ *************************************************/
+function collectItems_rakuten(seen, maxPages) {
+  const all = [];
+  let total = 0;
+  let page = 1;
+  for (; page <= maxPages; page++) {
+    const res = fetchApiPage_rakuten(page);
+    if (!res.ok) {
+      if (page === 1) return { ok: false, items: [], pages: 0, total: 0, reason: res.reason };
+      console.log(`${page}ページ目取得失敗(${res.reason})。取得済み分で処理を続行`);
+      break; // 途中失敗は取れた分で処理
+    }
+    total = res.total;
+    const pageItems = res.items;
+    if (pageItems.length === 0) break; // 末尾 or 該当なし
+
+    all.push(...pageItems);
+
+    // このページが全て既知 → 以降はもっと古い（既知）商品なので深掘り不要
+    const hasNew = pageItems.some(it => !seen.has(it.id));
+    if (!hasNew) break;
+    // 満杯でなければ最終ページ
+    if (pageItems.length < HITS_RAKUTEN) break;
+
+    Utilities.sleep(1100); // レート制限対策（次ページ取得前に1.1秒）
+  }
+  return { ok: true, items: all, pages: Math.min(page, maxPages), total: total, reason: "" };
+}
+
+/*************************************************
+ * APIの1ページ取得。429/5xxを指数バックオフで再試行。
+ *  戻り値: { ok, items:[{id,url,name,price,image,shop}], total, reason }
+ *************************************************/
+function fetchApiPage_rakuten(page) {
+  const params =
+    "?applicationId=" + encodeURIComponent(APP_ID_RAKUTEN) +
+    "&accessKey=" + encodeURIComponent(ACCESS_KEY_RAKUTEN) + // クエリにも付与（保険）
+    "&shopCode=" + encodeURIComponent(SHOP_CODE_RAKUTEN) +
+    "&sort=" + encodeURIComponent("-updateTimestamp") +
+    "&hits=" + HITS_RAKUTEN +
+    "&page=" + page +
+    "&format=json";
+  const url = ENDPOINT_RAKUTEN + params;
+
+  const options = {
+    method: "get",
+    muteHttpExceptions: true,
+    followRedirects: true,
+    headers: {
+      "accessKey": ACCESS_KEY_RAKUTEN, // 新仕様：ヘッダーで認証
+      "Origin": ORIGIN_RAKUTEN,        // 許可Webサイトと一致必須
+      "Referer": ORIGIN_RAKUTEN + "/",
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+      "Accept": "application/json"
+    }
+  };
+
+  const MAX_ATTEMPTS = 4;
+  let lastReason = "";
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    const res = UrlFetchApp.fetch(url, options);
+    const code = res.getResponseCode();
+    console.log(`API p${page} Status (try ${attempt}) : ${code}`);
+
+    if (code === 200) {
+      try {
+        const data = JSON.parse(res.getContentText());
+        return { ok: true, items: parseItems_rakuten(data), total: Number(data.count || 0), reason: "" };
+      } catch (e) {
+        console.log("JSONパース失敗: " + e);
+        return { ok: false, items: [], total: 0, reason: "json-parse" };
+      }
+    }
+
+    lastReason = String(code);
+    // 403は恒久エラーの可能性が高い（許可Webサイト未登録/キー誤り）→ 通知して打ち切り
+    if (code === 403) {
+      console.log("403: 許可Webサイト未登録 or applicationId/accessKey誤りの可能性: " +
+                  res.getContentText().slice(0, 300));
+      if (page === 1) {
+        notifyByEmail_rakuten(
+          "【楽天BRING監視】API 403エラー",
+          "楽天APIが403を返しました。以下を確認してください:\n" +
+          "・applicationId / accessKey が正しいか\n" +
+          "・API/バックエンドサービス型: 許可IPに 0.0.0.0/0 を設定したか\n" +
+          "・Webアプリ型: 許可Webサイトに " + ORIGIN_RAKUTEN + " を登録したか\n\n" +
+          res.getContentText().slice(0, 500)
+        );
+      }
+      return { ok: false, items: [], total: 0, reason: "403" };
+    }
+    if (code !== 429 && code < 500) {
+      // 400等の恒久エラーは再試行しても無駄
+      console.log("恒久エラー: " + res.getContentText().slice(0, 300));
+      return { ok: false, items: [], total: 0, reason: lastReason };
+    }
+
+    // 429 / 5xx → 待って再試行
+    let waitSec = Math.pow(2, attempt); // 2,4,8,16秒
+    const ra = res.getAllHeaders()["Retry-After"] || res.getAllHeaders()["retry-after"];
+    if (ra) waitSec = Math.max(waitSec, Number(ra));
+    waitSec = Math.min(waitSec, 30);
+    if (attempt < MAX_ATTEMPTS) {
+      console.log(`一時エラーのため ${waitSec}秒待機して再取得`);
+      Utilities.sleep(waitSec * 1000);
+    }
+  }
+  return { ok: false, items: [], total: 0, reason: lastReason || "unknown" };
+}
+
+/*************************************************
+ * JSONパース（Items[].Item → 正規化）
+ *  各商品: id(itemCode) / url / name / price / image / shop
+ *  ※新旧レスポンス差異に強くなるよう防御的に取り出す。
+ *************************************************/
+function parseItems_rakuten(data) {
+  const arr = (data && data.Items) ? data.Items : [];
+  const items = [];
+  for (const el of arr) {
+    const it = (el && el.Item) ? el.Item : el; // {Item:{...}} でも {...} でも対応
+    if (!it) continue;
+    const id = it.itemCode;
+    if (!id) continue; // itemCodeが一意ID。無ければスキップ
+    items.push({
+      id: id,
+      url: it.itemUrl || (SHOP_TOP_RAKUTEN),
+      name: (it.itemName || "(商品名不明)").toString().trim(),
+      price: it.itemPrice != null ? String(it.itemPrice) : "?",
+      image: extractImage_rakuten(it),
+      shop: it.shopName || "BRING"
+    });
+  }
+  return items;
+}
+
+// mediumImageUrls は [{imageUrl}] / ["url"] の両形式に対応。無ければsmallも見る。
+function extractImage_rakuten(it) {
+  const pick = (list) => {
+    if (!list || !list.length) return "";
+    const first = list[0];
+    let u = (typeof first === "string") ? first : (first && first.imageUrl) ? first.imageUrl : "";
+    return u ? u.replace(/\?_ex=\d+x\d+$/, "") : ""; // サイズ指定を外して大きめ画像に
+  };
+  return pick(it.mediumImageUrls) || pick(it.smallImageUrls);
+}
+
+/*************************************************
+ * 既知ID（seenIds）の読み書き
+ *************************************************/
+function loadSeen_rakuten(props) {
+  const raw = props.getProperty(SEEN_KEY_RAKUTEN);
+  let arr = [];
+  try { arr = raw ? JSON.parse(raw) : []; } catch (e) { arr = []; }
+  return new Set(arr);
+}
+
+// currentIds(新着順)を先頭に、既存の既知IDを後ろに結合し、重複排除してMAX_SEENで丸める
+function saveSeen_rakuten(props, currentIds, oldSeenSet) {
+  const merged = [];
+  const pushed = new Set();
+  const pushId = id => { if (!pushed.has(id)) { pushed.add(id); merged.push(id); } };
+
+  currentIds.forEach(pushId);  // 今回見た最新IDを優先保持
+  oldSeenSet.forEach(pushId);  // 続いて過去のID
+  const capped = merged.slice(0, MAX_SEEN_RAKUTEN);
+  props.setProperty(SEEN_KEY_RAKUTEN, JSON.stringify(capped));
+  console.log("既知IDを更新: " + capped.length + "件保持");
+}
+
+/*************************************************
+ * 未送信キューの再送
+ *************************************************/
+function flushPending_rakuten(props) {
+  const raw = props.getProperty(PENDING_KEY_RAKUTEN);
+  if (!raw) return;
+
+  let queue;
+  try { queue = JSON.parse(raw); } catch (e) { queue = []; }
+  if (!queue.length) return;
+
+  console.log("未送信キュー再送開始: " + queue.length + "件");
+  const remain = [];
+  queue.forEach(payload => {
+    const ok = postDiscord_rakuten(payload);
+    if (!ok) remain.push(payload); // まだダメなら残す
+    else Utilities.sleep(1200);
+  });
+
+  if (remain.length) {
+    props.setProperty(PENDING_KEY_RAKUTEN, JSON.stringify(remain));
+    console.log("再送できなかった残: " + remain.length + "件");
+  } else {
+    props.deleteProperty(PENDING_KEY_RAKUTEN);
+    console.log("未送信キューを全て再送完了");
+  }
+}
+
+function enqueuePending_rakuten(props, payload) {
+  const raw = props.getProperty(PENDING_KEY_RAKUTEN);
+  let queue = [];
+  try { queue = raw ? JSON.parse(raw) : []; } catch (e) { queue = []; }
+  queue.push(payload);
+  if (queue.length > 20) queue = queue.slice(queue.length - 20); // 溜まりすぎ防止
+  props.setProperty(PENDING_KEY_RAKUTEN, JSON.stringify(queue));
+  console.log("未送信キューに保存。現在 " + queue.length + "件");
+}
+
+/*************************************************
+ * Discord送信（embed・10件バッチ）
+ *  ・全バッチ成功で true。失敗バッチはキューに退避して false を返す。
+ *************************************************/
+function postDiscordEmbeds_rakuten(props, items) {
+  let okAll = true;
+  for (let i = 0; i < items.length; i += EMBED_BATCH_RAKUTEN) {
+    const chunk = items.slice(i, i + EMBED_BATCH_RAKUTEN);
+    const first = (i === 0);
+    const payload = buildDiscordPayload_rakuten(chunk, items.length, first);
+
+    const ok = postDiscord_rakuten(payload);
+    if (!ok) {
+      okAll = false;
+      enqueuePending_rakuten(props, payload); // 次回再送
+    }
+    Utilities.sleep(1200); // メッセージ間ウェイト（429予防）
+  }
+  return okAll;
+}
+
+// 1バッチ分のDiscord payload（embed配列）を組み立てる
+function buildDiscordPayload_rakuten(chunk, totalCount, isFirst) {
+  const embeds = chunk.map(p => {
+    const embed = {
+      title: p.name.slice(0, 250),
+      url: p.url,
+      color: 0xBF0000, // 楽天レッド系
+      fields: [{ name: "価格", value: formatPrice_rakuten(p.price), inline: true }],
+      footer: { text: "楽天 BRING（bring-sg）新着" }
+    };
+    if (p.image) embed.thumbnail = { url: p.image };
+    return embed;
+  });
+
+  const payload = { username: "楽天BRING新着", embeds: embeds };
+  if (isFirst) payload.content = `🆕 楽天 BRING 新商品 ${totalCount}件`;
+  return payload;
+}
+
+/*************************************************
+ * Discord送信（1リクエスト）。429は retry_after 尊重で最大3回再送。
+ *  成功=true / 失敗=false
+ *************************************************/
+function postDiscord_rakuten(payload) {
+  const options = {
+    method: "post",
+    contentType: "application/json",
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  };
+
+  const MAX_ATTEMPTS = 3;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    const res = UrlFetchApp.fetch(WEBHOOK_URL_RAKUTEN, options);
+    const code = res.getResponseCode();
+    console.log(`Discord Status (try ${attempt}) : ${code}`);
+
+    if (code >= 200 && code < 300) return true; // 成功（通常204）
+    if (code !== 429) {
+      console.log("Discord error: " + res.getContentText().slice(0, 300));
+      return false;
+    }
+
+    // --- 429 の待ち時間を算出 ---
+    let waitSec = 5;
+    try {
+      const body = JSON.parse(res.getContentText());
+      if (typeof body.retry_after === "number") {
+        waitSec = body.retry_after;
+        console.log(`429 global=${body.global} retry_after=${waitSec}s`);
+      }
+    } catch (e) {
+      console.log("429本文がJSONでない→Cloudflare/共有IP制限の可能性");
+    }
+    const ra = res.getAllHeaders()["Retry-After"] || res.getAllHeaders()["retry-after"];
+    if (ra) waitSec = Math.max(waitSec, Number(ra));
+    waitSec = Math.min(Math.ceil(waitSec) + 1, 60);
+
+    if (attempt < MAX_ATTEMPTS) {
+      console.log(`${waitSec}秒待機して再送`);
+      Utilities.sleep(waitSec * 1000);
+    }
+  }
+  console.log("Discord送信失敗（429継続）→ キューに退避します");
+  return false;
+}
+
+/*************************************************
+ * メール用の全商品リスト（文字数制限なし＝全リンク）
+ *************************************************/
+function buildFullList_rakuten(items) {
+  let text = `楽天 BRING 新商品 ${items.length}件（全リンク）\n\n`;
+  items.forEach(p => {
+    text += `■ ${p.name}\n${formatPrice_rakuten(p.price)}\n${p.url}\n\n`;
+  });
+  return text;
+}
+
+// 価格文字列 → "¥1,234"。数値化できなければ "価格不明"。
+function formatPrice_rakuten(price) {
+  const n = Number(price);
+  return isFinite(n) && n > 0 ? "¥" + n.toLocaleString() : "価格不明";
+}
+
+/*************************************************
+ * メール通知（Discordと別経路で確実に届く）
+ *************************************************/
+function notifyByEmail_rakuten(subject, body) {
+  if (!ALERT_EMAIL_RAKUTEN) return;
+  try {
+    MailApp.sendEmail(ALERT_EMAIL_RAKUTEN, subject, body);
+    console.log("メール送信: " + ALERT_EMAIL_RAKUTEN);
+  } catch (e) {
+    console.log("メール送信失敗: " + e);
+  }
+}
+
+/*************************************************
+ * テスト / 初期化 / メール権限承認
+ *************************************************/
+// APIを1ページ叩いてパース結果をログに出す（通知はしない）
+function testApi_rakuten() {
+  const res = fetchApiPage_rakuten(1);
+  if (!res.ok) {
+    console.log("取得失敗: " + res.reason);
+    return;
+  }
+  console.log("総ヒット: " + res.total + " / パース件数: " + res.items.length);
+  res.items.slice(0, 5).forEach(p =>
+    console.log(`- [${p.id}] ${p.name} / ¥${p.price} / ${p.shop} / ${p.url}`)
+  );
+}
+
+function testDiscord_rakuten() {
+  postDiscord_rakuten({ content: "楽天BRING監視 テスト通知" });
+}
+
+function resetMonitor_rakuten() {
+  // ★楽天BRING用のキーだけ削除（他監視のプロパティは消さない）
+  const props = PropertiesService.getScriptProperties();
+  props.deleteProperty(SEEN_KEY_RAKUTEN);
+  props.deleteProperty(PENDING_KEY_RAKUTEN);
+  console.log("楽天BRING監視のデータを初期化しました");
+}
+
+// メール権限(send_mail)を承認するため、初回に1回だけ手動実行する
+function authorizeMail_rakuten() {
+  MailApp.sendEmail(ALERT_EMAIL_RAKUTEN, "権限承認テスト", "MailAppの送信権限を承認できました。");
+  console.log("メール送信成功");
+}
